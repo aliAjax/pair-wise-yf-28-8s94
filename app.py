@@ -15,6 +15,8 @@ from urllib.parse import urlparse
 BASE_DIR = Path(__file__).resolve().parent
 DEFAULT_DB = BASE_DIR / "randomization.db"
 MAX_ARM_LENGTH = 40
+LEDGER_VERSION = 1
+LEDGER_GENESIS = hashlib.sha256(b"clinical-trial-randomization-ledger/v1").hexdigest()
 
 
 class BusinessError(Exception):
@@ -95,8 +97,27 @@ class RandomizationStore:
                     actor_id TEXT NOT NULL REFERENCES users(id), action TEXT NOT NULL,
                     detail TEXT NOT NULL, created_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS audit_ledger(
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    trial_id INTEGER NOT NULL REFERENCES trials(id),
+                    chain_seq INTEGER NOT NULL,
+                    audit_id INTEGER NOT NULL REFERENCES audit_log(id),
+                    prev_hash TEXT NOT NULL,
+                    entry_hash TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    UNIQUE(trial_id,chain_seq),
+                    UNIQUE(audit_id)
+                );
+                CREATE TABLE IF NOT EXISTS chain_verifications(
+                    trial_id INTEGER PRIMARY KEY REFERENCES trials(id),
+                    status TEXT NOT NULL CHECK(status IN ('intact','broken')),
+                    verified_at TEXT NOT NULL,
+                    chain_length INTEGER NOT NULL,
+                    breakpoints_json TEXT NOT NULL DEFAULT '[]'
+                );
                 """
             )
+            self._backfill_ledger(conn)
 
     def seed(self):
         self.init_schema()
@@ -129,10 +150,163 @@ class RandomizationStore:
         return row
 
     def _audit(self, conn, trial_id, actor, action, detail):
-        conn.execute(
+        detail_json = json.dumps(detail, ensure_ascii=False, sort_keys=True)
+        created_at = now()
+        cur = conn.execute(
             "INSERT INTO audit_log(trial_id,actor_id,action,detail,created_at) VALUES(?,?,?,?,?)",
-            (trial_id, actor, action, json.dumps(detail, ensure_ascii=False, sort_keys=True), now()),
+            (trial_id, actor, action, detail_json, created_at),
         )
+        self._append_ledger(conn, trial_id, cur.lastrowid, actor, action, detail_json, created_at)
+
+    def _ledger_hash(self, trial_id, audit_id, actor_id, action, detail_json, created_at, chain_seq, prev_hash):
+        content = {
+            "v": LEDGER_VERSION,
+            "audit_id": audit_id,
+            "trial_id": trial_id,
+            "actor_id": actor_id,
+            "action": action,
+            "detail": detail_json,
+            "created_at": created_at,
+            "chain_seq": chain_seq,
+            "prev_hash": prev_hash,
+        }
+        payload = json.dumps(content, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+    def _append_ledger(self, conn, trial_id, audit_id, actor_id, action, detail_json, created_at):
+        """在当前写事务内追加一条链。必须与审计记录在同一事务中提交，失败整体回滚，不留半条链。
+
+        链位由事务内 SELECT 决定，并由 UNIQUE(trial_id,chain_seq) 兜底，
+        保证两名值班员并发提交分配动作时不会写出同一链位。
+        """
+        last = conn.execute(
+            "SELECT chain_seq,entry_hash FROM audit_ledger WHERE trial_id=? ORDER BY chain_seq DESC LIMIT 1",
+            (trial_id,),
+        ).fetchone()
+        chain_seq = (last["chain_seq"] + 1) if last else 1
+        prev_hash = last["entry_hash"] if last else LEDGER_GENESIS
+        entry_hash = self._ledger_hash(trial_id, audit_id, actor_id, action, detail_json, created_at, chain_seq, prev_hash)
+        conn.execute(
+            "INSERT INTO audit_ledger(trial_id,chain_seq,audit_id,prev_hash,entry_hash,created_at) VALUES(?,?,?,?,?,?)",
+            (trial_id, chain_seq, audit_id, prev_hash, entry_hash, created_at),
+        )
+
+    def _backfill_ledger(self, conn):
+        """旧库升级：对已有审计记录但尚无链的试验，按现有 id 顺序回填摘要。
+
+        在 init_schema 的同一事务内执行，失败回滚，重试时链仍为空，不会留下半条链。
+        """
+        trials = conn.execute("SELECT id FROM trials ORDER BY id").fetchall()
+        for t in trials:
+            trial_id = t["id"]
+            ledger_count = conn.execute("SELECT COUNT(*) FROM audit_ledger WHERE trial_id=?", (trial_id,)).fetchone()[0]
+            audit_count = conn.execute("SELECT COUNT(*) FROM audit_log WHERE trial_id=?", (trial_id,)).fetchone()[0]
+            if ledger_count == 0 and audit_count > 0:
+                self._backfill_trial_ledger(conn, trial_id)
+
+    def _backfill_trial_ledger(self, conn, trial_id):
+        audits = conn.execute("SELECT * FROM audit_log WHERE trial_id=? ORDER BY id", (trial_id,)).fetchall()
+        prev_hash = LEDGER_GENESIS
+        for seq, a in enumerate(audits, start=1):
+            entry_hash = self._ledger_hash(
+                trial_id, a["id"], a["actor_id"], a["action"], a["detail"], a["created_at"], seq, prev_hash
+            )
+            conn.execute(
+                "INSERT INTO audit_ledger(trial_id,chain_seq,audit_id,prev_hash,entry_hash,created_at) VALUES(?,?,?,?,?,?)",
+                (trial_id, seq, a["id"], prev_hash, entry_hash, a["created_at"]),
+            )
+            prev_hash = entry_hash
+
+    def verify_chain(self, user_id, trial_id):
+        """核验试验的追加账，返回被改写、漏记或缺失的断点，并持久化链状态与最近校验时间。"""
+        with self.connect() as conn:
+            actor = self._user(conn, user_id, {"coordinator", "monitor"})
+            trial = self._trial(conn, trial_id)
+            ledger = conn.execute("SELECT * FROM audit_ledger WHERE trial_id=? ORDER BY chain_seq", (trial_id,)).fetchall()
+            audits = conn.execute("SELECT * FROM audit_log WHERE trial_id=? ORDER BY id", (trial_id,)).fetchall()
+            audit_by_id = {a["id"]: a for a in audits}
+            breakpoints = []
+            seen_audit_ids = set()
+            prev_hash = LEDGER_GENESIS
+            expected_seq = 1
+            for entry in ledger:
+                if entry["chain_seq"] != expected_seq:
+                    breakpoints.append({
+                        "type": "missing",
+                        "chain_seq": expected_seq,
+                        "message": f"链位 {expected_seq} 缺失，下一条为 {entry['chain_seq']}",
+                    })
+                    expected_seq = entry["chain_seq"]
+                if entry["prev_hash"] != prev_hash:
+                    breakpoints.append({
+                        "type": "broken_link",
+                        "chain_seq": entry["chain_seq"],
+                        "audit_id": entry["audit_id"],
+                        "message": f"链位 {entry['chain_seq']} 前向链接断裂",
+                    })
+                audit = audit_by_id.get(entry["audit_id"])
+                if audit is None:
+                    breakpoints.append({
+                        "type": "orphan",
+                        "chain_seq": entry["chain_seq"],
+                        "audit_id": entry["audit_id"],
+                        "message": f"链位 {entry['chain_seq']} 引用的审计记录 {entry['audit_id']} 不存在",
+                    })
+                else:
+                    recomputed = self._ledger_hash(
+                        trial_id, audit["id"], audit["actor_id"], audit["action"],
+                        audit["detail"], audit["created_at"], entry["chain_seq"], entry["prev_hash"],
+                    )
+                    if recomputed != entry["entry_hash"]:
+                        breakpoints.append({
+                            "type": "rewritten",
+                            "chain_seq": entry["chain_seq"],
+                            "audit_id": entry["audit_id"],
+                            "message": f"链位 {entry['chain_seq']} 对应的审计记录 {audit['id']} 内容被改写",
+                        })
+                    seen_audit_ids.add(entry["audit_id"])
+                prev_hash = entry["entry_hash"]
+                expected_seq = entry["chain_seq"] + 1
+            for a in audits:
+                if a["id"] not in seen_audit_ids:
+                    breakpoints.append({
+                        "type": "omitted",
+                        "audit_id": a["id"],
+                        "message": f"审计记录 {a['id']}（{a['action']}）未入链",
+                    })
+            status = "intact" if not breakpoints else "broken"
+            verified_at = now()
+            conn.execute(
+                """INSERT INTO chain_verifications(trial_id,status,verified_at,chain_length,breakpoints_json)
+                   VALUES(?,?,?,?,?)
+                   ON CONFLICT(trial_id) DO UPDATE SET status=excluded.status, verified_at=excluded.verified_at,
+                       chain_length=excluded.chain_length, breakpoints_json=excluded.breakpoints_json""",
+                (trial_id, status, verified_at, len(ledger), json.dumps(breakpoints, ensure_ascii=False)),
+            )
+            return {
+                "trial_id": trial_id,
+                "status": status,
+                "chain_length": len(ledger),
+                "last_verified_at": verified_at,
+                "breakpoints": breakpoints,
+            }
+
+    def get_chain(self, user_id, trial_id):
+        with self.connect() as conn:
+            actor = self._user(conn, user_id, {"coordinator", "monitor", "site"})
+            trial = self._trial(conn, trial_id)
+            rows = conn.execute(
+                """SELECT l.chain_seq,l.audit_id,l.prev_hash,l.entry_hash,l.created_at,
+                          a.actor_id,a.action,a.detail
+                   FROM audit_ledger l LEFT JOIN audit_log a ON a.id=l.audit_id
+                   WHERE l.trial_id=? ORDER BY l.chain_seq""",
+                (trial_id,),
+            ).fetchall()
+            return {
+                "trial_id": trial_id,
+                "chain_length": len(rows),
+                "entries": [dict(r) for r in rows],
+            }
 
     def create_trial(self, user_id, name, protocol_version, arms, strata_factors, block_size, seed):
         name = name.strip()
@@ -387,9 +561,17 @@ class RandomizationStore:
                 f"SELECT site_id,COUNT(*) AS count FROM participants WHERE trial_id=?" + where + " GROUP BY site_id", params
             ).fetchall()
             audit = conn.execute("SELECT * FROM audit_log WHERE trial_id=? ORDER BY id", (trial_id,)).fetchall()
+            verification = conn.execute("SELECT * FROM chain_verifications WHERE trial_id=?", (trial_id,)).fetchone()
+            chain_count = conn.execute("SELECT COUNT(*) FROM audit_ledger WHERE trial_id=?", (trial_id,)).fetchone()[0]
+            chain = {
+                "status": verification["status"] if verification else "unverified",
+                "last_verified_at": verification["verified_at"] if verification else None,
+                "chain_length": chain_count,
+            }
             return {
                 "trial": {"id": trial["id"], "name": trial["name"], "protocol_version": trial["protocol_version"], "status": trial["status"]},
                 "participants_visible": total, "by_site": [dict(x) for x in by_site],
+                "chain": chain,
                 "audit": [dict(x) | {"detail": json.loads(x["detail"])} for x in audit],
             }
 
@@ -426,6 +608,8 @@ class Handler(BaseHTTPRequestHandler):
             if len(parts)==4 and parts[3]=="enroll" and method=="POST":
                 d=self._body(); return self._send(201, store.enroll(user,trial_id,d.get("external_id",""),d.get("factors",{})))
             if len(parts)==4 and parts[3]=="summary" and method=="GET": return self._send(200, store.trial_summary(user,trial_id))
+            if len(parts)==4 and parts[3]=="verify" and method=="POST": return self._send(200, store.verify_chain(user,trial_id))
+            if len(parts)==4 and parts[3]=="chain" and method=="GET": return self._send(200, store.get_chain(user,trial_id))
         if len(parts)==3 and parts[:2]==["api","participants"] and method=="GET": return self._send(200, store.get_participant(user,int(parts[2])))
         if len(parts)==4 and parts[:2]==["api","participants"] and parts[3]=="unblinding-requests" and method=="POST":
             d=self._body(); return self._send(201, store.request_unblinding(user,int(parts[2]),d.get("reason","")))
