@@ -15,6 +15,15 @@ from urllib.parse import urlparse
 BASE_DIR = Path(__file__).resolve().parent
 DEFAULT_DB = BASE_DIR / "randomization.db"
 MAX_ARM_LENGTH = 40
+GENESIS_PREV = "0" * 64  # 链首条目的 prev_digest
+
+
+def audit_digest(prev_digest, trial_id, actor_id, action, detail_json, created_at):
+    """审计条目摘要：SHA-256(前一条摘要 ‖ 规范化内容)，detail_json 须为已规范化的 JSON 文本。"""
+    payload = "\x1f".join(
+        [prev_digest, str(trial_id) if trial_id is not None else "", actor_id, action, detail_json, created_at]
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 class BusinessError(Exception):
@@ -95,7 +104,66 @@ class RandomizationStore:
                     actor_id TEXT NOT NULL REFERENCES users(id), action TEXT NOT NULL,
                     detail TEXT NOT NULL, created_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS audit_chain_meta(
+                    trial_id INTEGER PRIMARY KEY,  -- 0 表示 trial_id 为 NULL 的全局链
+                    last_seq INTEGER NOT NULL, last_digest TEXT NOT NULL,
+                    backfilled_at TEXT, last_verified_at TEXT, last_verify_status TEXT
+                );
                 """
+            )
+        self._ensure_audit_chain()
+
+    def _ensure_audit_chain(self):
+        """为审计表补链列并回填历史数据；旧库升级与新库初始化都走这里，可重复执行。"""
+        with self._lock, self.connect() as conn:
+            cols = {row[1] for row in conn.execute("PRAGMA table_info(audit_log)")}
+            for column, ddl in (
+                ("seq", "ALTER TABLE audit_log ADD COLUMN seq INTEGER"),
+                ("prev_digest", "ALTER TABLE audit_log ADD COLUMN prev_digest TEXT"),
+                ("digest", "ALTER TABLE audit_log ADD COLUMN digest TEXT"),
+            ):
+                if column not in cols:
+                    conn.execute(ddl)
+            if conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='index' AND name='audit_log_chain_uq'"
+            ).fetchone() is None:
+                conn.execute(
+                    """CREATE UNIQUE INDEX audit_log_chain_uq ON audit_log(
+                           CASE WHEN trial_id IS NULL THEN 0 ELSE trial_id END, seq)"""
+                )
+            self._backfill_audit_chain(conn)
+
+    def _backfill_audit_chain(self, conn):
+        """按既有 id 顺序为缺摘要的历史条目回填，已回填的行保持不变。"""
+        rows = conn.execute(
+            """SELECT id, COALESCE(trial_id,0) AS chain_key, trial_id, actor_id, action, detail, created_at
+               FROM audit_log WHERE digest IS NULL ORDER BY id"""
+        ).fetchall()
+        if not rows:
+            return
+        chains = {}
+        for row in conn.execute("SELECT trial_id, last_seq, last_digest FROM audit_chain_meta"):
+            chains[row["trial_id"]] = (row["last_seq"], row["last_digest"])
+        touched = set()
+        for row in rows:
+            key = row["chain_key"]
+            seq, prev = chains.get(key, (0, GENESIS_PREV))
+            seq += 1
+            digest = audit_digest(prev, row["trial_id"], row["actor_id"], row["action"], row["detail"], row["created_at"])
+            conn.execute(
+                "UPDATE audit_log SET seq=?, prev_digest=?, digest=? WHERE id=?",
+                (seq, prev, digest, row["id"]),
+            )
+            chains[key] = (seq, digest)
+            touched.add(key)
+        for key in touched:
+            seq, digest = chains[key]
+            conn.execute(
+                """INSERT INTO audit_chain_meta(trial_id,last_seq,last_digest,backfilled_at)
+                   VALUES(?,?,?,?)
+                   ON CONFLICT(trial_id) DO UPDATE SET last_seq=excluded.last_seq,
+                       last_digest=excluded.last_digest, backfilled_at=excluded.backfilled_at""",
+                (key, seq, digest, now()),
             )
 
     def seed(self):
@@ -129,9 +197,35 @@ class RandomizationStore:
         return row
 
     def _audit(self, conn, trial_id, actor, action, detail):
+        """追加一条带摘要的审计记录。
+
+        调用方必须已在事务中持有写锁（BEGIN IMMEDIATE 或已发生的写操作），
+        因此对 audit_chain_meta 的读-改-写是串行的：两个值班员同时提交时，
+        后到者在前者提交前阻塞，提交后读到新的链尾，不会写出同一链位。
+        条目与业务写入同事务提交，写盘失败整体回滚，重试不会留下半条链。
+        """
+        detail_json = json.dumps(detail, ensure_ascii=False, sort_keys=True)
+        created_at = now()
+        chain_key = trial_id if trial_id is not None else 0
+        row = conn.execute(
+            "SELECT last_seq, last_digest FROM audit_chain_meta WHERE trial_id=?", (chain_key,)
+        ).fetchone()
+        seq, prev = (row["last_seq"] + 1, row["last_digest"]) if row else (1, GENESIS_PREV)
+        digest = audit_digest(prev, trial_id, actor, action, detail_json, created_at)
+        if row:
+            conn.execute(
+                "UPDATE audit_chain_meta SET last_seq=?, last_digest=? WHERE trial_id=?",
+                (seq, digest, chain_key),
+            )
+        else:
+            conn.execute(
+                "INSERT INTO audit_chain_meta(trial_id,last_seq,last_digest) VALUES(?,?,?)",
+                (chain_key, seq, digest),
+            )
         conn.execute(
-            "INSERT INTO audit_log(trial_id,actor_id,action,detail,created_at) VALUES(?,?,?,?,?)",
-            (trial_id, actor, action, json.dumps(detail, ensure_ascii=False, sort_keys=True), now()),
+            """INSERT INTO audit_log(trial_id,actor_id,action,detail,created_at,seq,prev_digest,digest)
+               VALUES(?,?,?,?,?,?,?,?)""",
+            (trial_id, actor, action, detail_json, created_at, seq, prev, digest),
         )
 
     def create_trial(self, user_id, name, protocol_version, arms, strata_factors, block_size, seed):
@@ -148,37 +242,47 @@ class RandomizationStore:
         if isinstance(block_size, bool) or not isinstance(block_size, int) or block_size < len(arms) or block_size % len(arms) != 0:
             raise BusinessError("区组长度必须为试验组数的正整数倍", 422, "invalid_block_size")
         with self.connect() as conn:
-            actor = self._user(conn, user_id, {"coordinator"})
             try:
-                cur = conn.execute(
-                    """INSERT INTO trials(name,protocol_version,arms_json,strata_factors_json,block_size,seed,created_by,created_at)
-                       VALUES(?,?,?,?,?,?,?,?)""",
-                    (name, protocol_version.strip(), json.dumps(arms), json.dumps([str(x).strip() for x in strata_factors]), block_size, seed.strip(), user_id, now()),
-                )
-            except sqlite3.IntegrityError:
-                raise BusinessError("试验名称已存在", 409, "trial_exists")
-            trial_id = cur.lastrowid
-            self._audit(conn, trial_id, user_id, "trial.create", {"protocol_version": protocol_version, "arms": len(arms), "block_size": block_size})
-            return {"id": trial_id, "name": name, "status": "draft", "arms": arms, "strata_factors": strata_factors, "block_size": block_size}
+                conn.execute("BEGIN IMMEDIATE")
+                actor = self._user(conn, user_id, {"coordinator"})
+                try:
+                    cur = conn.execute(
+                        """INSERT INTO trials(name,protocol_version,arms_json,strata_factors_json,block_size,seed,created_by,created_at)
+                           VALUES(?,?,?,?,?,?,?,?)""",
+                        (name, protocol_version.strip(), json.dumps(arms), json.dumps([str(x).strip() for x in strata_factors]), block_size, seed.strip(), user_id, now()),
+                    )
+                except sqlite3.IntegrityError:
+                    raise BusinessError("试验名称已存在", 409, "trial_exists")
+                trial_id = cur.lastrowid
+                self._audit(conn, trial_id, user_id, "trial.create", {"protocol_version": protocol_version, "arms": len(arms), "block_size": block_size})
+                return {"id": trial_id, "name": name, "status": "draft", "arms": arms, "strata_factors": strata_factors, "block_size": block_size}
+            except Exception:
+                conn.rollback()
+                raise
 
     def update_protocol(self, user_id, trial_id, protocol_version, arms=None, strata_factors=None, block_size=None, seed=None):
         with self.connect() as conn:
-            actor = self._user(conn, user_id, {"coordinator"})
-            trial = self._trial(conn, trial_id)
-            enrolled = conn.execute("SELECT COUNT(*) FROM participants WHERE trial_id=?", (trial_id,)).fetchone()[0]
-            if enrolled or trial["status"] != "draft":
-                raise BusinessError("入组开始后不能修改随机方案", 409, "protocol_locked")
-            new_arms = arms if arms is not None else json.loads(trial["arms_json"])
-            new_strata = strata_factors if strata_factors is not None else json.loads(trial["strata_factors_json"])
-            new_block = block_size if block_size is not None else trial["block_size"]
-            new_seed = str(seed) if seed is not None else trial["seed"]
-            self.create_trial_validation_only(new_arms, new_strata, new_block, new_seed)
-            conn.execute(
-                """UPDATE trials SET protocol_version=?,arms_json=?,strata_factors_json=?,block_size=?,seed=? WHERE id=?""",
-                (protocol_version.strip(), json.dumps(new_arms), json.dumps(new_strata), new_block, new_seed, trial_id),
-            )
-            self._audit(conn, trial_id, user_id, "protocol.update", {"protocol_version": protocol_version})
-            return {"id": trial_id, "protocol_version": protocol_version, "arms": new_arms, "block_size": new_block}
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                actor = self._user(conn, user_id, {"coordinator"})
+                trial = self._trial(conn, trial_id)
+                enrolled = conn.execute("SELECT COUNT(*) FROM participants WHERE trial_id=?", (trial_id,)).fetchone()[0]
+                if enrolled or trial["status"] != "draft":
+                    raise BusinessError("入组开始后不能修改随机方案", 409, "protocol_locked")
+                new_arms = arms if arms is not None else json.loads(trial["arms_json"])
+                new_strata = strata_factors if strata_factors is not None else json.loads(trial["strata_factors_json"])
+                new_block = block_size if block_size is not None else trial["block_size"]
+                new_seed = str(seed) if seed is not None else trial["seed"]
+                self.create_trial_validation_only(new_arms, new_strata, new_block, new_seed)
+                conn.execute(
+                    """UPDATE trials SET protocol_version=?,arms_json=?,strata_factors_json=?,block_size=?,seed=? WHERE id=?""",
+                    (protocol_version.strip(), json.dumps(new_arms), json.dumps(new_strata), new_block, new_seed, trial_id),
+                )
+                self._audit(conn, trial_id, user_id, "protocol.update", {"protocol_version": protocol_version})
+                return {"id": trial_id, "protocol_version": protocol_version, "arms": new_arms, "block_size": new_block}
+            except Exception:
+                conn.rollback()
+                raise
 
     @staticmethod
     def create_trial_validation_only(arms, strata_factors, block_size, seed):
@@ -193,13 +297,18 @@ class RandomizationStore:
 
     def start_trial(self, user_id, trial_id):
         with self.connect() as conn:
-            self._user(conn, user_id, {"coordinator"})
-            trial = self._trial(conn, trial_id)
-            if trial["status"] != "draft":
-                raise BusinessError("只有草稿试验可以开始", 409, "invalid_status")
-            conn.execute("UPDATE trials SET status='running',started_at=? WHERE id=?", (now(), trial_id))
-            self._audit(conn, trial_id, user_id, "trial.start", {})
-            return {"id": trial_id, "status": "running"}
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                self._user(conn, user_id, {"coordinator"})
+                trial = self._trial(conn, trial_id)
+                if trial["status"] != "draft":
+                    raise BusinessError("只有草稿试验可以开始", 409, "invalid_status")
+                conn.execute("UPDATE trials SET status='running',started_at=? WHERE id=?", (now(), trial_id))
+                self._audit(conn, trial_id, user_id, "trial.start", {})
+                return {"id": trial_id, "status": "running"}
+            except Exception:
+                conn.rollback()
+                raise
 
     def _stratum(self, conn, trial, factors, site_id):
         expected = json.loads(trial["strata_factors_json"])
@@ -328,23 +437,28 @@ class RandomizationStore:
         if len(reason.strip()) < 8:
             raise BusinessError("揭盲原因至少 8 字", 422, "reason_required")
         with self.connect() as conn:
-            actor = self._user(conn, user_id, {"site", "coordinator"})
-            participant = conn.execute("SELECT * FROM participants WHERE id=?", (participant_id,)).fetchone()
-            if not participant:
-                raise BusinessError("受试者不存在", 404, "not_found")
-            if actor["role"] == "site" and participant["site_id"] != actor["site_id"]:
-                raise BusinessError("不能申请其他中心的揭盲", 403, "site_isolation")
-            open_request = conn.execute(
-                "SELECT id FROM unblinding_requests WHERE participant_id=? AND status='pending'", (participant_id,)
-            ).fetchone()
-            if open_request:
-                raise BusinessError("该受试者已有待审批的揭盲申请", 409, "request_exists")
-            cur = conn.execute(
-                "INSERT INTO unblinding_requests(participant_id,requester_id,reason,created_at) VALUES(?,?,?,?)",
-                (participant_id, user_id, reason.strip(), now()),
-            )
-            self._audit(conn, participant["trial_id"], user_id, "unblinding.request", {"request_id": cur.lastrowid, "participant_id": participant_id})
-            return {"id": cur.lastrowid, "status": "pending"}
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                actor = self._user(conn, user_id, {"site", "coordinator"})
+                participant = conn.execute("SELECT * FROM participants WHERE id=?", (participant_id,)).fetchone()
+                if not participant:
+                    raise BusinessError("受试者不存在", 404, "not_found")
+                if actor["role"] == "site" and participant["site_id"] != actor["site_id"]:
+                    raise BusinessError("不能申请其他中心的揭盲", 403, "site_isolation")
+                open_request = conn.execute(
+                    "SELECT id FROM unblinding_requests WHERE participant_id=? AND status='pending'", (participant_id,)
+                ).fetchone()
+                if open_request:
+                    raise BusinessError("该受试者已有待审批的揭盲申请", 409, "request_exists")
+                cur = conn.execute(
+                    "INSERT INTO unblinding_requests(participant_id,requester_id,reason,created_at) VALUES(?,?,?,?)",
+                    (participant_id, user_id, reason.strip(), now()),
+                )
+                self._audit(conn, participant["trial_id"], user_id, "unblinding.request", {"request_id": cur.lastrowid, "participant_id": participant_id})
+                return {"id": cur.lastrowid, "status": "pending"}
+            except Exception:
+                conn.rollback()
+                raise
 
     def approve_unblinding(self, user_id, request_id):
         with self.connect() as conn:
@@ -375,6 +489,101 @@ class RandomizationStore:
                 conn.rollback()
                 raise
 
+    @staticmethod
+    def _check_audit_chain(conn, chain_key):
+        """重算一条链的全部摘要，返回 (checked, issues)；断点按链位顺序报告。"""
+        rows = conn.execute(
+            """SELECT id, seq, prev_digest, digest, trial_id, actor_id, action, detail, created_at
+               FROM audit_log WHERE COALESCE(trial_id,0)=? ORDER BY seq""",
+            (chain_key,),
+        ).fetchall()
+        issues, expected_seq, expected_prev = [], 1, GENESIS_PREV
+        for row in rows:
+            where = f"seq={row['seq']}" if row["seq"] is not None else f"id={row['id']}"
+            if row["seq"] is None or row["prev_digest"] is None or row["digest"] is None:
+                issues.append({"kind": "unsealed", "entry_id": row["id"], "detail": f"{where} 缺少摘要"})
+                if row["seq"] is not None:
+                    expected_seq = row["seq"] + 1
+                    expected_prev = None
+                continue
+            if row["seq"] != expected_seq:
+                issues.append({
+                    "kind": "gap", "entry_id": row["id"],
+                    "detail": f"链位 {expected_seq} 缺失或漏记，下一条位于 {row['seq']}",
+                })
+            if expected_prev is not None and row["prev_digest"] != expected_prev:
+                issues.append({
+                    "kind": "broken_link", "entry_id": row["id"],
+                    "detail": f"seq={row['seq']} 的前置摘要与上一条不符，链条在此断开",
+                })
+            recomputed = audit_digest(
+                row["prev_digest"], row["trial_id"], row["actor_id"], row["action"], row["detail"], row["created_at"]
+            )
+            if recomputed != row["digest"]:
+                issues.append({
+                    "kind": "tampered", "entry_id": row["id"],
+                    "detail": f"seq={row['seq']} 内容与摘要不符，记录被改写",
+                })
+            expected_seq, expected_prev = row["seq"] + 1, row["digest"]
+        meta = conn.execute(
+            "SELECT last_seq, last_digest FROM audit_chain_meta WHERE trial_id=?", (chain_key,)
+        ).fetchone()
+        if meta and (
+            meta["last_seq"] != expected_seq - 1
+            or (expected_prev is not None and meta["last_digest"] != expected_prev)
+        ):
+            issues.append({
+                "kind": "tail_tampered", "entry_id": None,
+                "detail": f"链尾与链元数据不符：元数据记录链尾 seq={meta['last_seq']}，实际走到 seq={expected_seq - 1}，尾部条目可能被删除",
+            })
+        return len(rows), issues
+
+    def verify_audit_chain(self, user_id, trial_id=None):
+        """核验审计链：重算摘要并定位被改写、漏记或缺失的断点，结果与校验时间落库。"""
+        with self.connect() as conn:
+            self._user(conn, user_id, {"coordinator", "monitor"})
+            if trial_id is not None:
+                self._trial(conn, trial_id)
+                chain_keys = [trial_id]
+            else:
+                chain_keys = [
+                    r[0] for r in conn.execute(
+                        "SELECT DISTINCT COALESCE(trial_id,0) FROM audit_log ORDER BY 1"
+                    ).fetchall()
+                ]
+            chains, issues, checked = [], [], 0
+            for key in chain_keys:
+                n, chain_issues = self._check_audit_chain(conn, key)
+                checked += n
+                issues.extend(chain_issues)
+                chains.append({"trial_id": None if key == 0 else key, "entries": n, "issues": len(chain_issues)})
+            status = "ok" if not issues else "failed"
+            verified_at = now()
+            conn.executemany(
+                """INSERT INTO audit_chain_meta(trial_id,last_seq,last_digest,last_verified_at,last_verify_status)
+                   VALUES(?,0,'',?,?)
+                   ON CONFLICT(trial_id) DO UPDATE SET last_verified_at=excluded.last_verified_at,
+                       last_verify_status=excluded.last_verify_status""",
+                [(key, verified_at, status) for key in chain_keys],
+            )
+            return {"status": status, "checked_entries": checked, "chains": chains, "issues": issues, "verified_at": verified_at}
+
+    def _chain_status(self, conn, trial_id):
+        meta = conn.execute(
+            "SELECT last_seq, last_digest, last_verified_at, last_verify_status FROM audit_chain_meta WHERE trial_id=?",
+            (trial_id,),
+        ).fetchone()
+        legacy = conn.execute(
+            "SELECT COUNT(*) FROM audit_log WHERE trial_id=? AND digest IS NULL", (trial_id,)
+        ).fetchone()[0]
+        return {
+            "entries": meta["last_seq"] if meta else 0,
+            "head_digest": meta["last_digest"] if meta else None,
+            "legacy_unsealed": legacy,
+            "last_verified_at": meta["last_verified_at"] if meta else None,
+            "last_verify_status": meta["last_verify_status"] if meta else None,
+        }
+
     def trial_summary(self, user_id, trial_id):
         with self.connect() as conn:
             actor = self._user(conn, user_id, {"site", "coordinator", "monitor"})
@@ -391,6 +600,7 @@ class RandomizationStore:
                 "trial": {"id": trial["id"], "name": trial["name"], "protocol_version": trial["protocol_version"], "status": trial["status"]},
                 "participants_visible": total, "by_site": [dict(x) for x in by_site],
                 "audit": [dict(x) | {"detail": json.loads(x["detail"])} for x in audit],
+                "chain": self._chain_status(conn, trial_id),
             }
 
 
@@ -426,6 +636,8 @@ class Handler(BaseHTTPRequestHandler):
             if len(parts)==4 and parts[3]=="enroll" and method=="POST":
                 d=self._body(); return self._send(201, store.enroll(user,trial_id,d.get("external_id",""),d.get("factors",{})))
             if len(parts)==4 and parts[3]=="summary" and method=="GET": return self._send(200, store.trial_summary(user,trial_id))
+            if len(parts)==5 and parts[3:]==["audit","verify"] and method=="POST": return self._send(200, store.verify_audit_chain(user,trial_id))
+        if parts==["api","audit","verify"] and method=="POST": return self._send(200, store.verify_audit_chain(user))
         if len(parts)==3 and parts[:2]==["api","participants"] and method=="GET": return self._send(200, store.get_participant(user,int(parts[2])))
         if len(parts)==4 and parts[:2]==["api","participants"] and parts[3]=="unblinding-requests" and method=="POST":
             d=self._body(); return self._send(201, store.request_unblinding(user,int(parts[2]),d.get("reason","")))
